@@ -102,7 +102,7 @@ function initialize_fc_lite() {
         
         statsContainer.innerHTML = `
             <div>Powered by: <a href="https://github.com/willow-god/Friend-Circle-Lite" target="_blank">FriendCircleLite</a><br></div>
-            <div>Designed By: <a href="https://www.liushen.fun/" target="_blank">LiuShen</a><br></div>
+            <div>Designed By: <a href="https://blog.081531.xyz/" target="_blank">喵洛阁</a><br></div>
             <div>更新时间:${stats.last_updated_time}</div>
         `;
 

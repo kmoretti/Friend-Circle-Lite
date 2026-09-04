@@ -16,14 +16,49 @@ from friend_circle_lite.crawler.service import FeedResolver, FriendCircleCrawlSe
 from friend_circle_lite.all_friends import deal_with_large_data, merge_link_data_from_json_url
 from friend_circle_lite.app_config import ApplicationConfig
 from friend_circle_lite.cli import FriendCircleLiteApplication
-from friend_circle_lite.link_checker.service import LinkReachabilityService
+from friend_circle_lite.link_checker.service import LinkReachabilityService, RetryBackoffPolicy
 from friend_circle_lite.models import Article, CacheRecord, FeedEndpoint, LinkCheckRecord, LinkMethodStatus, Website
 from friend_circle_lite.outputs.legacy_api import _to_public_link
 from friend_circle_lite.storage.diagnostics import SQLiteDebugDumper
 from friend_circle_lite.utils.json import write_json
+from friend_circle_lite.utils.config import load_raw_config
 
 
 class RefactorContractsTest(unittest.TestCase):
+    def test_repository_variable_overrides_nested_config_without_editing_yaml(self):
+        from friend_circle_lite.utils.config import _apply_config_overrides
+
+        original = {
+            "merge_settings": {
+                "enable": False,
+                "remote_base_url": "https://default.example",
+            },
+            "spider_settings": {"article_count": 5},
+        }
+
+        with patch.dict(
+            "os.environ",
+            {
+                "FCL_CONFIG_OVERRIDES": (
+                    "merge_settings.enable=true\n"
+                    "merge_settings.remote_base_url=https://remote.example\n"
+                    "spider_settings.article_count=8\n"
+                    "# ignored comment\n"
+                )
+            },
+            clear=True,
+        ):
+            loaded = load_raw_config("conf.yaml")
+            overridden = _apply_config_overrides(original, "merge_settings.enable=true\nspider_settings.article_count=8")
+
+        self.assertTrue(loaded["merge_settings"]["enable"])
+        self.assertEqual(loaded["merge_settings"]["remote_base_url"], "https://remote.example")
+        self.assertEqual(loaded["spider_settings"]["article_count"], 8)
+        self.assertFalse(original["merge_settings"]["enable"])
+        self.assertEqual(original["spider_settings"]["article_count"], 5)
+        self.assertTrue(overridden["merge_settings"]["enable"])
+        self.assertEqual(overridden["spider_settings"]["article_count"], 8)
+
     def test_github_action_schedule_uses_22_minute_offset(self):
         workflow = Path(".github/workflows/friend_circle_lite.yml").read_text(encoding="utf-8")
 
@@ -41,6 +76,15 @@ class RefactorContractsTest(unittest.TestCase):
                 workflow = workflow_path.read_text(encoding="utf-8")
                 self.assertIn("FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true", workflow)
 
+    def test_publish_workflow_skips_unchanged_page_tree(self):
+        workflow = Path(".github/workflows/friend_circle_lite.yml").read_text(encoding="utf-8")
+
+        self.assertIn('git fetch origin "${PAGE_BRANCH}:refs/remotes/origin/${PAGE_BRANCH}"', workflow)
+        self.assertIn('published_tree=$(git rev-parse "origin/${PAGE_BRANCH}^{tree}")', workflow)
+        self.assertIn("generated_tree=$(git write-tree)", workflow)
+        self.assertIn('[ "$generated_tree" = "$published_tree" ]', workflow)
+        self.assertIn("No static asset changes; skipping page branch update.", workflow)
+
     def test_static_index_is_standalone_dashboard_with_view_switch(self):
         html = Path("static/index.html").read_text(encoding="utf-8")
 
@@ -48,7 +92,21 @@ class RefactorContractsTest(unittest.TestCase):
         self.assertIn('data-view="articles"', html)
         self.assertIn('["first24", "前 24 条"]', html)
         link_config_start = html.index("links:", html.index("viewConfig"))
-        self.assertIn('defaultFilter: "unreachable"', html[link_config_start:html.index("articles:", link_config_start)])
+        link_config = html[link_config_start:html.index("articles:", link_config_start)]
+        self.assertIn('defaultFilter: "unreachable"', link_config)
+        expected_link_filters = [
+            '["unreachable", "不可达"]',
+            '["uncrawlable", "不可抓取"]',
+            '["noBacklink", "无反链"]',
+            '["stale", "久未更新"]',
+            '["all", "全部"]',
+        ]
+        for item in expected_link_filters:
+            self.assertIn(item, link_config)
+        positions = [link_config.index(item) for item in expected_link_filters]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn('["crawlable", "可抓取"]', link_config)
+        self.assertNotIn('["backlink", "反链"]', link_config)
         self.assertLess(
             html.index('["unreachable", "不可达"]', link_config_start),
             html.index('["all", "全部"]', link_config_start),
@@ -75,11 +133,18 @@ class RefactorContractsTest(unittest.TestCase):
         self.assertIn(".content-grid.is-links {\n        grid-template-columns: repeat(3, minmax(0, 1fr));", html)
         self.assertIn('content.className = `content-grid ${state.view === "links" ? "is-links" : "is-articles"}`;', html)
         self.assertIn(".link-card.featured", html)
-        self.assertIn('["stale", "久未更新"]', html)
+        self.assertIn('if (state.filter === "uncrawlable") return !link.rss;', html)
+        self.assertIn('if (state.filter === "noBacklink") return link.backlink !== true;', html)
         self.assertIn("sortLinks", html)
         self.assertIn("visibleDetails", html)
         self.assertIn("renderSurfaceFacts", html)
         self.assertIn("primaryInsight", html)
+        self.assertIn("formatUnreachableDays", html)
+        self.assertIn("const unreachableDays = formatUnreachableDays(link);", html)
+        self.assertIn('label: "不可达时长"', html)
+        self.assertIn("unreachable_days", html)
+        self.assertNotIn("fail_count", html)
+        self.assertNotIn("fails:", html)
         self.assertNotIn("formatFailureAge", html)
         self.assertNotIn("fa-solid fa-rotate", html)
         self.assertNotIn("--leaf", html)
@@ -179,9 +244,149 @@ class RefactorContractsTest(unittest.TestCase):
             "reachable": False,
             "crawl_allowed": False,
             "best_latency": 0.31,
+            "unreachable_since": "2026-06-26 12:00:00",
         })
 
         self.assertEqual(public_link["latency"], -1)
+        self.assertNotIn("fail_count", public_link)
+        self.assertEqual(public_link["unreachable_since"], "2026-06-26 12:00:00")
+
+    def test_unreachable_record_tracks_since_time_and_rounds_days_up(self):
+        record = LinkCheckRecord(
+            name="Blocked",
+            url="https://blocked.example/",
+            checked_at="2026-06-27 10:00:00",
+            reachable=False,
+            unreachable_since="2026-06-26 12:00:00",
+        )
+
+        with patch("friend_circle_lite.domain.models.datetime") as fake_datetime:
+            fake_datetime.now.return_value = datetime(2026, 6, 27, 10, 0, 0)
+            fake_datetime.strptime.side_effect = datetime.strptime
+            public_link = record.to_link_dict()
+
+        self.assertEqual(public_link["unreachable_days"], 1)
+        self.assertEqual(public_link["unreachable_since"], "2026-06-26 12:00:00")
+        self.assertNotIn("fail_count", public_link)
+
+    def test_first_unreachable_check_uses_current_time_as_since_time(self):
+        class Store:
+            def load_records(self, urls):
+                return {}
+
+            def save_records(self, records):
+                return True
+
+        service = LinkReachabilityService(
+            config=ApplicationConfig.from_dict({"link_check": {"enable": True}}).link_check,
+            proxy_settings=ProxySettings(),
+            store=Store(),
+        )
+        website = Website(name="Blocked", url="https://blocked.example/", avatar="avatar.png")
+
+        with patch.object(service, "_now_text", return_value="2026-06-27 10:00:00"):
+            record = service._compose_non_rss_record(
+                website,
+                cached=None,
+                homepage=LinkMethodStatus(False, None, -1),
+                api=LinkMethodStatus(False, None, -1),
+            )
+
+        self.assertFalse(record.reachable)
+        self.assertEqual(record.unreachable_since, "2026-06-27 10:00:00")
+
+    def test_unreachable_cache_can_be_reused_within_max_age(self):
+        class Store:
+            def is_fresh(self, record, max_age_hours):
+                return True
+
+        service = LinkReachabilityService(
+            config=ApplicationConfig.from_dict({"link_check": {"max_age_hours": 24}}).link_check,
+            proxy_settings=ProxySettings(),
+            store=Store(),
+        )
+        cached = LinkCheckRecord(
+            name="Blocked",
+            url="https://blocked.example/",
+            checked_at="2026-06-27 08:00:00",
+            reachable=False,
+            best_latency=-1,
+            unreachable_since="2026-06-26 12:00:00",
+        )
+
+        self.assertTrue(service._can_reuse_cached_record(cached, Website(name="Blocked", url="https://blocked.example/")))
+
+    def test_retry_backoff_policy_scales_with_continuous_failure_days(self):
+        with patch("friend_circle_lite.domain.models.datetime") as fake_datetime:
+            fake_datetime.now.return_value = datetime(2026, 6, 27, 12, 0, 0)
+            fake_datetime.strptime.side_effect = datetime.strptime
+
+            self.assertEqual(RetryBackoffPolicy.effective_max_age_hours("2026-06-18 12:00:00", 24), 24)
+            self.assertEqual(RetryBackoffPolicy.effective_max_age_hours("2026-06-17 12:00:00", 24), 120)
+            self.assertEqual(RetryBackoffPolicy.effective_max_age_hours("2026-05-28 12:00:00", 24), 240)
+            self.assertEqual(RetryBackoffPolicy.effective_max_age_hours("2026-04-28 12:00:00", 24), 360)
+
+    def test_rss_unavailable_record_tracks_since_time_without_public_json_output(self):
+        class Store:
+            def load_records(self, urls):
+                return {}
+
+            def save_records(self, records):
+                return True
+
+        service = LinkReachabilityService(
+            config=ApplicationConfig.from_dict({"link_check": {"enable": True}}).link_check,
+            proxy_settings=ProxySettings(),
+            store=Store(),
+        )
+        website = Website(name="NoRSS", url="https://norss.example/", avatar="avatar.png")
+
+        with patch.object(service, "_now_text", return_value="2026-06-27 10:00:00"):
+            record = service._compose_non_rss_record(
+                website,
+                cached=None,
+                homepage=LinkMethodStatus(True, 200, 0.2),
+                api=LinkMethodStatus(False, None, -1),
+            )
+
+        self.assertTrue(record.reachable)
+        self.assertFalse(record.crawl_allowed)
+        self.assertEqual(record.rss_unavailable_since, "2026-06-27 10:00:00")
+        self.assertEqual(record.unreachable_since, "")
+        public_link = record.to_link_dict()
+        self.assertNotIn("rss_unavailable_since", public_link)
+
+    def test_rss_unavailable_cache_uses_dynamic_backoff_interval(self):
+        class Store:
+            calls = []
+
+            def is_fresh(self, record, max_age_hours):
+                self.calls.append(max_age_hours)
+                return max_age_hours == 120
+
+        service = LinkReachabilityService(
+            config=ApplicationConfig.from_dict({"link_check": {"max_age_hours": 24}}).link_check,
+            proxy_settings=ProxySettings(),
+            store=Store(),
+        )
+        cached = LinkCheckRecord(
+            name="NoRSS",
+            url="https://norss.example/",
+            checked_at="2026-06-26 08:00:00",
+            reachable=True,
+            crawl_allowed=False,
+            best_method="homepage",
+            best_latency=0.2,
+            rss_unavailable_since="2026-06-17 08:00:00",
+        )
+
+        with patch("friend_circle_lite.link_checker.service.datetime") as fake_datetime:
+            fake_datetime.now.return_value = datetime(2026, 6, 27, 8, 0, 0)
+            fake_datetime.strptime.side_effect = datetime.strptime
+            reused = service._can_reuse_cached_record(cached, Website(name="NoRSS", url="https://norss.example/"))
+
+        self.assertTrue(reused)
+        self.assertEqual(service.store.calls, [120])
 
     def test_link_check_logs_total_cached_and_actual_check_counts(self):
         class Store:
@@ -700,7 +905,6 @@ class RefactorContractsTest(unittest.TestCase):
             crawl_allowed=True,
             best_method="proxy",
             best_latency=1.2,
-            fail_count=0,
             backlink_checked=True,
             has_author_link=True,
             rss_crawl_reason="allowed_by_proxy",
@@ -716,7 +920,8 @@ class RefactorContractsTest(unittest.TestCase):
             "reachable": True,
             "crawlable": True,
             "latency": 1.2,
-            "fail_count": 0,
+            "unreachable_days": None,
+            "unreachable_since": "",
             "has_backlink": True,
             "updated": "",
             "stale_days": None,
@@ -789,6 +994,121 @@ class RefactorContractsTest(unittest.TestCase):
         self.assertEqual(text, '{"statistical_data":{"link_total_num":1},"link_data":[{"name":"站点"}]}')
         self.assertEqual(json.loads(text)["link_data"][0]["name"], "站点")
 
+    def test_write_json_preserves_semantically_unchanged_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "link.json"
+            original = '{\n  "link_data": [{"name": "站点"}],\n  "statistical_data": {"link_total_num": 1}\n}\n'
+            path.write_text(original, encoding="utf-8")
+
+            self.assertTrue(write_json(path, {
+                "statistical_data": {"link_total_num": 1},
+                "link_data": [{"name": "站点"}],
+            }))
+
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_write_json_replaces_changed_file_with_minified_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "link.json"
+            path.write_text('{"link_data":[]}', encoding="utf-8")
+
+            self.assertTrue(write_json(path, {
+                "statistical_data": {"link_total_num": 1},
+                "link_data": [{"name": "站点"}],
+            }))
+
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                '{"statistical_data":{"link_total_num":1},"link_data":[{"name":"站点"}]}',
+            )
+
+    def test_write_json_replaces_invalid_or_undecodable_file(self):
+        invalid_files = {
+            "truncated": b'{"link_data":',
+            "non_utf8": b'\xff\xfe',
+        }
+
+        for name, existing in invalid_files.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "link.json"
+                path.write_bytes(existing)
+
+                self.assertTrue(write_json(path, {"link_data": []}))
+                self.assertEqual(path.read_text(encoding="utf-8"), '{"link_data":[]}')
+
+    def test_write_json_skips_when_only_volatile_timestamps_change(self):
+        cases = {
+            "all_json_last_updated_time": {
+                "original": (
+                    '{"statistical_data":{"friends_num":1,"article_num":1,'
+                    '"last_updated_time":"2026-08-01 10:00:00"},'
+                    '"article_data":[{"title":"A","created":"2026-08-01 09:00","link":"https://a","author":"x","avatar":""}]}'
+                ),
+                "payload": {
+                    "statistical_data": {
+                        "friends_num": 1,
+                        "article_num": 1,
+                        "last_updated_time": "2026-08-15 23:59:59",
+                    },
+                    "article_data": [{
+                        "title": "A",
+                        "created": "2026-08-01 09:00",
+                        "link": "https://a",
+                        "author": "x",
+                        "avatar": "",
+                    }],
+                },
+            },
+            "link_json_last_checked_time": {
+                "original": (
+                    '{"statistical_data":{"link_total_num":1,"link_last_checked_time":"2026-08-01 10:00:00"},'
+                    '"link_data":[{"name":"站点","link":"https://site.example","reachable":true}]}'
+                ),
+                "payload": {
+                    "statistical_data": {
+                        "link_total_num": 1,
+                        "link_last_checked_time": "2026-08-15 23:59:59",
+                    },
+                    "link_data": [{
+                        "name": "站点",
+                        "link": "https://site.example",
+                        "reachable": True,
+                    }],
+                },
+            },
+        }
+
+        for name, case in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / f"{name}.json"
+                path.write_text(case["original"], encoding="utf-8")
+
+                self.assertTrue(write_json(path, case["payload"]))
+                self.assertEqual(path.read_text(encoding="utf-8"), case["original"])
+
+    def test_write_json_rewrites_when_content_changes_even_if_time_matches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "all.json"
+            path.write_text(
+                '{"statistical_data":{"friends_num":1,"last_updated_time":"2026-08-01 10:00:00"},'
+                '"article_data":[{"title":"Old"}]}',
+                encoding="utf-8",
+            )
+
+            self.assertTrue(write_json(path, {
+                "statistical_data": {
+                    "friends_num": 1,
+                    "last_updated_time": "2026-08-01 10:00:00",
+                },
+                "article_data": [{"title": "New"}],
+            }))
+
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                '{"statistical_data":{"friends_num":1,"last_updated_time":"2026-08-01 10:00:00"},'
+                '"article_data":[{"title":"New"}]}',
+            )
+
     def test_link_merge_keeps_best_reachability_shape(self):
         local = {
             "statistical_data": {},
@@ -801,7 +1121,8 @@ class RefactorContractsTest(unittest.TestCase):
                 "crawlable": False,
                 "method": "api",
                 "latency": 3.0,
-                "fail_count": 2,
+                "unreachable_since": "2026-06-05 12:00:00",
+                "unreachable_days": 2,
                 "checked_at": "2026-06-05 12:00:00",
                 "has_backlink": None,
                 "reason": "blocked_api_only",
@@ -818,7 +1139,8 @@ class RefactorContractsTest(unittest.TestCase):
                 "crawlable": True,
                 "method": "proxy",
                 "latency": 1.0,
-                "fail_count": 0,
+                "unreachable_since": "",
+                "unreachable_days": None,
                 "checked_at": "2026-06-06 12:00:00",
                 "has_backlink": True,
                 "reason": "allowed_by_proxy",
@@ -836,7 +1158,8 @@ class RefactorContractsTest(unittest.TestCase):
         self.assertNotIn("checked_at", merged["link_data"][0])
         self.assertNotIn("reason", merged["link_data"][0])
         self.assertEqual(merged["link_data"][0]["latency"], 1.0)
-        self.assertEqual(merged["link_data"][0]["fail_count"], 0)
+        self.assertNotIn("fail_count", merged["link_data"][0])
+        self.assertIsNone(merged["link_data"][0]["unreachable_days"])
         self.assertTrue(merged["link_data"][0]["has_backlink"])
         self.assertEqual(merged["statistical_data"]["link_total_num"], 1)
         self.assertNotIn("stats", merged)
@@ -1004,9 +1327,9 @@ class RefactorContractsTest(unittest.TestCase):
             self.assertIn("缺少当前字段", output)
             with closing(sqlite3.connect(db_path)) as connection:
                 row = connection.execute(
-                    "SELECT url, name, checked_at, crawl_allowed, best_method FROM link_check_state"
+                    "SELECT url, name, checked_at, crawl_allowed, best_method, rss_unavailable_since FROM link_check_state"
                 ).fetchone()
-            self.assertEqual(row, ("https://site.example", "Site", "", 0, "none"))
+            self.assertEqual(row, ("https://site.example", "Site", "", 0, "none", ""))
 
 
 if __name__ == "__main__":
